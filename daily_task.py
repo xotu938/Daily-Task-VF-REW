@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Daily Task 自动任务 (Playwright + hcaptcha-challenger + Gemini API免费方案)
+Daily Task 自动任务 (Playwright + hcaptcha-challenger + Gemini 免费API)
 ═══════════════════════════════════════════════════════════════
 完全免费方案：
   - hcaptcha-challenger 通过 Gemini 免费额度自动解 hCaptcha
@@ -9,10 +9,17 @@ Daily Task 自动任务 (Playwright + hcaptcha-challenger + Gemini API免费方�
   - 任意代理节点可用（sing-box 转换 vless/vmess/trojan/ss/hysteria2/tuic）
   - GitHub Actions 全自动无人值守
 
+[优化版 v2.0]
+✅ 增加验证码重试机制（最多10次）
+✅ 优化Gemini模型选择（自动降级）
+✅ 增加代理IP质量检测
+✅ 改进错误处理和调试信息
+✅ 增加任务级重试
+
 环境变量：
   ACCOUNTS          邮箱:密码（必填）
-  GEMINI_API_KEY    Gemini API Key（必填，https://aistudio.google.com/apikey 免费）
-  PROXY_STR         代理节点（选填：vless/vmess/trojan/ss/hy2/tuic/socks5/http）
+  GEMINI_API_KEY    Gemini API Key（必填，多个用逗号分隔）
+  PROXY_STR         代理节点（选填）
   TG_BOT_TOKEN      Telegram Bot Token（选填）
   TG_CHAT_ID        Telegram Chat ID（选填）
 """
@@ -38,6 +45,8 @@ PROXY_STR   = os.getenv("PROXY_STR", "")
 GEMINI_KEYS = [k.strip() for k in os.getenv("GEMINI_API_KEY", "").split(",") if k.strip()]
 
 SS_DIR = "screenshots"
+MAX_CAPTCHA_ATTEMPTS = 10  # 增加到10次
+CAPTCHA_TIMEOUT = 60  # 验证码超时时间
 # ========================================
 
 
@@ -106,7 +115,7 @@ def parse_account(raw):
 
 
 # ══════════════════════════════════════════════════════════
-# 代理转换（复用原项目 convert_proxy.py 逻辑，内置免依赖）
+# 代理转换（优化版）
 # ══════════════════════════════════════════════════════════
 
 def generate_config(proxy_url):
@@ -337,14 +346,37 @@ def start_proxy():
             subprocess.run(["pkill", "-f", "sing-box run"], capture_output=True)
             time.sleep(1)
         if _launch_singbox(node):
-            return "http://127.0.0.1:8080"
+            # 验证IP质量
+            if check_ip_quality():
+                return "http://127.0.0.1:8080"
+            else:
+                log("⚠️ IP质量不佳，尝试下一个节点")
+                subprocess.run(["pkill", "-f", "sing-box run"], capture_output=True)
 
     log("❌ 所有节点均失败，尝试直连")
     return None
 
 
+def check_ip_quality():
+    """检查IP质量（简单检查）"""
+    try:
+        # 测试延迟和可用性
+        start = time.time()
+        r = requests.get("https://www.google.com",
+                        proxies={"http": "http://127.0.0.1:8080",
+                                "https": "http://127.0.0.1:8080"},
+                        timeout=10)
+        latency = time.time() - start
+        if r.status_code == 200 and latency < 5:
+            log(f"✅ IP质量检查通过 (延迟: {latency:.2f}s)")
+            return True
+    except:
+        pass
+    return False
+
+
 # ══════════════════════════════════════════════════════════
-# hCaptcha 检测
+# hCaptcha 检测（优化版）
 # ══════════════════════════════════════════════════════════
 
 async def is_hcaptcha_present(page):
@@ -437,7 +469,7 @@ def install_token_listener(page, holder):
     page.on("response", on_response)
 
 
-async def wait_token(page, holder, timeout=60):
+async def wait_token(page, holder, timeout=CAPTCHA_TIMEOUT):
     """等待 token 出现（监听器抓到的或页面 textarea 里的）"""
     start = time.time()
     while time.time() - start < timeout:
@@ -451,40 +483,45 @@ async def wait_token(page, holder, timeout=60):
 
 
 # ══════════════════════════════════════════════════════════
-# 登录 & 续期
+# 登录 & 续期（优化版）
 # ══════════════════════════════════════════════════════════
 
 async def build_agent(page, key_index=0):
     """用第 key_index 个 Key 初始化 hcaptcha-challenger Agent
-    模型策略：gemini-3.5-flash-lite（免费1000次/天，配额充足）
+    模型策略：自动选择可用模型，429 时自动降级
     """
     from hcaptcha_challenger import AgentV, AgentConfig
     os.environ["GEMINI_API_KEY"] = GEMINI_KEYS[key_index % len(GEMINI_KEYS)]
-    # 偶数索引用强模型，奇数索引用快速模型（多Key轮换时自动分散负载）
-    primary = "gemini-3.5-flash-lite"
+    
+    # 模型优先级列表（自动降级）
+    models = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.0-flash-exp"]
+    primary_model = models[key_index % len(models)]
+    
     agent_config = AgentConfig(
         CHALLENGE_CLASSIFIER_MODEL="gemini-3.5-flash-lite",
-        IMAGE_CLASSIFIER_MODEL=primary,
-        SPATIAL_POINT_REASONER_MODEL=primary,
-        SPATIAL_PATH_REASONER_MODEL=primary,
+        IMAGE_CLASSIFIER_MODEL=primary_model,
+        SPATIAL_POINT_REASONER_MODEL=primary_model,
+        SPATIAL_PATH_REASONER_MODEL=primary_model,
         EXECUTION_TIMEOUT=240,
         RESPONSE_TIMEOUT=90,
         RETRY_ON_FAILURE=True,
         WAIT_FOR_CHALLENGE_VIEW_TO_RENDER_MS=5000,
     )
-    log(f"  🧠 识别模型: {primary}")
+    log(f"  🧠 识别模型: {primary_model}")
     return AgentV(page=page, agent_config=agent_config)
 
 
-async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=5):
-    """用 hcaptcha-challenger 自动解 hCaptcha。
-    核心改进：库的多轮挑战存在 frame 竞态（点 Verify 后 view 消失导致崩溃），
-    但答案实际已提交、hCaptcha 在后台验证。因此：
-      1. 用 response 监听器直接抓 checkcaptcha 的 token（最可靠）
-      2. 库崩溃/超时后先等 token 落地再决定是否重试
+async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=MAX_CAPTCHA_ATTEMPTS):
+    """用 hcaptcha-challenger 自动解 hCaptcha（优化版）
+    改进：
+      1. 增加到10次尝试
+      2. 自动切换Gemini Key
+      3. 更好的错误恢复
+      4. 增加随机延迟避免检测
     """
+    import random
     holder = agent_holder.setdefault("token_holder", {})
-
+    
     for attempt in range(1, max_attempts + 1):
         log(f"🔑 [{scene}] 解 hCaptcha ({attempt}/{max_attempts})...")
 
@@ -494,21 +531,24 @@ async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=5):
             log(f"  ✅ 已有 token: {token[:25]}...")
             return True
 
-        # 每轮都轮换 Key（6个不同项目，各1000次/天，分布式消耗）
-        cur_idx = (attempt - 1) % len(GEMINI_KEYS)
-        if agent_holder.get("key_index") != cur_idx:
-            agent_holder["key_index"] = cur_idx
-            log(f"  🔑 切换到第 {cur_idx + 1}/{len(GEMINI_KEYS)} 个 Key")
-            agent_holder["agent"] = await build_agent(page, cur_idx)
-
         agent = agent_holder.get("agent")
         if agent is None:
             log("  ❌ Agent 未初始化")
-            return False
+            # 尝试重新初始化
+            try:
+                agent_holder["agent"] = await build_agent(page, 0)
+                agent = agent_holder["agent"]
+            except Exception as e:
+                log(f"  ❌ Agent 初始化失败: {e}")
+                return False
 
         crashed = False
         try:
-            await agent.robotic_arm.click_checkbox()
+            # 使用异步超时控制
+            await asyncio.wait_for(
+                agent.robotic_arm.click_checkbox(),
+                timeout=30
+            )
             signal = await agent.wait_for_challenge()
             if signal.name == "SUCCESS" or str(signal).endswith("SUCCESS"):
                 log(f"  ✅ [{scene}] hCaptcha 挑战成功！")
@@ -516,6 +556,9 @@ async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=5):
                 await asyncio.sleep(3)
                 return True
             log(f"  ⚠️ [{scene}] 结果: {signal}")
+        except asyncio.TimeoutError:
+            crashed = True
+            log(f"  ⚠️ [{scene}] 操作超时")
         except Exception as e:
             crashed = True
             err = str(e)
@@ -525,11 +568,14 @@ async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=5):
                 idx = (agent_holder.get("key_index", 0) + 1) % len(GEMINI_KEYS)
                 log(f"  🔄 Key 配额耗尽，切换到第 {idx + 1} 个 Key...")
                 agent_holder["key_index"] = idx
-                agent_holder["agent"] = await build_agent(page, idx)
+                try:
+                    agent_holder["agent"] = await build_agent(page, idx)
+                except Exception as e2:
+                    log(f"  ❌ 切换Agent失败: {e2}")
 
         # 关键：库崩溃 ≠ 失败。答案可能已提交并在后台验证，等 token 落地
         log("  ⏳ 等待验证结果落地...")
-        token = await wait_token(page, holder, timeout=45)
+        token = await wait_token(page, holder, timeout=CAPTCHA_TIMEOUT)
         if token:
             log(f"  ✅ [{scene}] hCaptcha 实际已通过！（拦截到token）")
             return True
@@ -541,7 +587,9 @@ async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=5):
                 log("  🔄 已刷新挑战，开新题")
             except Exception:
                 pass
-        await asyncio.sleep(4)
+                
+        # 增加随机延迟，避免被检测
+        await asyncio.sleep(random.uniform(3, 8))
 
     token = await get_token(page) or holder.get("token", "")
     if token:
@@ -552,86 +600,146 @@ async def solve_hcaptcha(page, agent_holder, scene="page", max_attempts=5):
 
 async def site_login(page, agent_holder, email, password):
     log("🔐 登录目标站 ...")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-    await asyncio.sleep(5)
-
-    if await is_cf_page(page):
-        log("⏳ Cloudflare 页面，尝试通过...")
-        await wait_cf_pass(page, timeout=120)
-        await asyncio.sleep(2)
-
-    if await is_hcaptcha_present(page):
-        ok = await solve_hcaptcha(page, agent_holder, "login")
-        if not ok:
-            await save_screenshot(page, "01_captcha_failed")
-            return False, "登录页 hCaptcha 未解决"
-
-    await save_screenshot(page, "01_login_loaded")
-
     try:
-        email_el = page.locator("#emailaddress")
-        await email_el.click()
-        await email_el.fill(email)
-        log(f"  ✅ 邮箱: {mask_email(email)}")
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(5)
 
-        pwd_el = page.locator("#password")
-        await pwd_el.click()
-        await pwd_el.fill(password)
-        log("  ✅ 密码已填写")
-    except Exception as e:
-        await save_screenshot(page, "02_form_fail")
-        return False, f"表单填写失败: {str(e)[:100]}"
-
-    await asyncio.sleep(1)
-    await save_screenshot(page, "02_form_filled")
-
-    try:
-        submit = page.locator('button[type="submit"]')
-        if await submit.count() == 0:
-            submit = page.locator('input[type="submit"]')
-        await submit.first.click()
-        log("  → 已点击登录按钮")
-    except Exception as e:
-        return False, f"提交失败: {str(e)[:100]}"
-
-    await asyncio.sleep(6)
-
-    if await is_hcaptcha_present(page):
-        log("  🔍 提交后再次出现 hCaptcha")
-        ok = await solve_hcaptcha(page, agent_holder, "login_callback")
-        if ok:
+        if await is_cf_page(page):
+            log("⏳ Cloudflare 页面，尝试通过...")
+            await wait_cf_pass(page, timeout=120)
             await asyncio.sleep(2)
+
+        if await is_hcaptcha_present(page):
+            ok = await solve_hcaptcha(page, agent_holder, "login")
+            if not ok:
+                await save_screenshot(page, "01_captcha_failed")
+                return False, "登录页 hCaptcha 未解决"
+
+        await save_screenshot(page, "01_login_loaded")
+
+        # 尝试多种选择器
+        email_selectors = ["#emailaddress", "#email", "input[type='email']", "input[name='email']"]
+        pwd_selectors = ["#password", "input[type='password']", "input[name='password']"]
+        
+        email_filled = False
+        for selector in email_selectors:
             try:
-                submit = page.locator('button[type="submit"]')
-                await submit.first.click()
-                log("  → 再次点击登录按钮")
-            except Exception:
-                pass
-            await asyncio.sleep(6)
+                email_el = page.locator(selector).first
+                if await email_el.count() > 0:
+                    await email_el.click()
+                    await email_el.fill(email)
+                    log(f"  ✅ 邮箱已填写 (使用选择器: {selector})")
+                    email_filled = True
+                    break
+            except:
+                continue
+        
+        if not email_filled:
+            return False, "找不到邮箱输入框"
 
-    current = page.url.lower()
-    if "connexion" in current or "login" in current:
-        body = await page.inner_text("body")
-        if "Projets" not in body and "Projects" not in body:
-            await save_screenshot(page, "03_login_failed")
-            return False, "登录失败（仍在登录页）"
+        pwd_filled = False
+        for selector in pwd_selectors:
+            try:
+                pwd_el = page.locator(selector).first
+                if await pwd_el.count() > 0:
+                    await pwd_el.click()
+                    await pwd_el.fill(password)
+                    log("  ✅ 密码已填写")
+                    pwd_filled = True
+                    break
+            except:
+                continue
+        
+        if not pwd_filled:
+            return False, "找不到密码输入框"
 
-    await save_screenshot(page, "03_login_success")
-    log("  ✅ 登录成功")
-    return True, None
+        await asyncio.sleep(1)
+        await save_screenshot(page, "02_form_filled")
+
+        # 点击登录按钮
+        try:
+            submit_selectors = ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Login")', 'button:has-text("Sign in")']
+            clicked = False
+            for selector in submit_selectors:
+                submit = page.locator(selector).first
+                if await submit.count() > 0:
+                    await submit.click()
+                    log(f"  → 已点击登录按钮 (选择器: {selector})")
+                    clicked = True
+                    break
+            if not clicked:
+                return False, "找不到登录按钮"
+        except Exception as e:
+            return False, f"提交失败: {str(e)[:100]}"
+
+        await asyncio.sleep(6)
+
+        # 检查是否需要二次验证
+        if await is_hcaptcha_present(page):
+            log("  🔍 提交后再次出现 hCaptcha")
+            ok = await solve_hcaptcha(page, agent_holder, "login_callback")
+            if ok:
+                await asyncio.sleep(2)
+                try:
+                    # 再次点击提交按钮
+                    submit = page.locator('button[type="submit"]').first
+                    if await submit.count() > 0:
+                        await submit.click()
+                        log("  → 再次点击登录按钮")
+                except Exception:
+                    pass
+                await asyncio.sleep(6)
+
+        # 检查登录是否成功
+        current = page.url.lower()
+        if "connexion" in current or "login" in current:
+            body = await page.inner_text("body")
+            if "Projets" not in body and "Projects" not in body:
+                await save_screenshot(page, "03_login_failed")
+                # 尝试检查是否有错误消息
+                error_text = ""
+                try:
+                    error_el = page.locator(".error, .alert-danger, .alert")
+                    if await error_el.count() > 0:
+                        error_text = await error_el.first.inner_text()
+                except:
+                    pass
+                return False, f"登录失败: {error_text[:100]}"
+
+        await save_screenshot(page, "03_login_success")
+        log("  ✅ 登录成功")
+        return True, None
+        
+    except Exception as e:
+        log(f"❌ 登录异常: {e}")
+        await save_screenshot(page, "login_error")
+        return False, f"登录异常: {str(e)[:100]}"
 
 
 async def extract_expire_info(page):
     expire_time, open_time = "", ""
     try:
-        box = page.locator('xpath=//strong[contains(text(),"Expires:")]/..')
-        text = (await box.first.inner_text()).strip()
-        m1 = re.search(r'Expires:\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})', text)
-        if m1:
-            expire_time = m1.group(1)
-        m2 = re.search(r'opens in\s+(.+)', text)
-        if m2:
-            open_time = m2.group(1).strip()
+        # 尝试多种选择器
+        selectors = [
+            'xpath=//strong[contains(text(),"Expires:")]/..',
+            'xpath=//*[contains(text(),"Expires:")]',
+            '.expiry-time, .expire-info'
+        ]
+        for selector in selectors:
+            try:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    text = (await el.inner_text()).strip()
+                    m1 = re.search(r'Expires:\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})', text)
+                    if m1:
+                        expire_time = m1.group(1)
+                    m2 = re.search(r'opens in\s+(.+)', text)
+                    if m2:
+                        open_time = m2.group(1).strip()
+                    if expire_time:
+                        break
+            except:
+                continue
     except Exception:
         pass
     return expire_time, open_time
@@ -642,12 +750,29 @@ async def do_task(page, email):
     await page.goto(PROJECTS_URL, wait_until="domcontentloaded", timeout=60000)
     await asyncio.sleep(5)
 
+    # 查找并点击 Manage 按钮
+    manage_selectors = [
+        'xpath=//a[contains(normalize-space(.),"Manage")]',
+        'a:has-text("Manage")',
+        'button:has-text("Manage")'
+    ]
+    
     try:
-        manage = page.locator('xpath=//a[contains(normalize-space(.),"Manage")]').first
-        href = await manage.get_attribute("href")
-        log(f"  ✅ 找到 Manage: {href}")
-        await manage.click()
-        log("  ✅ 已点击 Manage")
+        clicked_manage = False
+        for selector in manage_selectors:
+            manage = page.locator(selector).first
+            if await manage.count() > 0:
+                href = await manage.get_attribute("href")
+                log(f"  ✅ 找到 Manage: {href}")
+                await manage.click()
+                log("  ✅ 已点击 Manage")
+                clicked_manage = True
+                break
+        
+        if not clicked_manage:
+            await save_screenshot(page, "04_no_manage")
+            await send_tg_screenshot(page, "找不到 Manage 按钮")
+            return False, "找不到 Manage 按钮"
     except Exception as e:
         await save_screenshot(page, "04_no_manage")
         await send_tg_screenshot(page, "找不到 Manage 按钮")
@@ -656,10 +781,25 @@ async def do_task(page, email):
     await asyncio.sleep(5)
     await save_screenshot(page, "05_manage_page")
 
-    task_btn = page.locator('xpath=//button[contains(.,"Renew 7 days")]')
-    try:
-        await task_btn.wait_for(state="visible", timeout=10000)
-    except Exception:
+    # 查找任务按钮
+    task_btn_selectors = [
+        'xpath=//button[contains(.,"Renew")]',
+        'button:has-text("Renew")',
+        'button:has-text("Extend")'
+    ]
+    
+    task_btn = None
+    for selector in task_btn_selectors:
+        try:
+            btn = page.locator(selector).first
+            if await btn.count() > 0:
+                await btn.wait_for(state="visible", timeout=10000)
+                task_btn = btn
+                break
+        except:
+            continue
+    
+    if not task_btn:
         await save_screenshot(page, "05_no_task_btn")
         await send_tg_screenshot(page, "找不到目标按钮")
         return False, "目标按钮未找到"
@@ -678,13 +818,18 @@ async def do_task(page, email):
     log("  ✅ 已点击续期按钮")
     await asyncio.sleep(6)
 
+    # 确认结果
     log("  ⏳ 再次进入确认结果...")
     await page.goto(PROJECTS_URL, wait_until="domcontentloaded", timeout=60000)
     await asyncio.sleep(5)
+    
     try:
-        manage = page.locator('xpath=//a[contains(normalize-space(.),"Manage")]').first
-        await manage.click()
-        await asyncio.sleep(5)
+        for selector in manage_selectors:
+            manage = page.locator(selector).first
+            if await manage.count() > 0:
+                await manage.click()
+                await asyncio.sleep(5)
+                break
     except Exception:
         pass
 
@@ -698,7 +843,7 @@ async def do_task(page, email):
 
 
 # ══════════════════════════════════════════════════════════
-# 主流程
+# 主流程（优化版）
 # ══════════════════════════════════════════════════════════
 
 async def run():
@@ -723,67 +868,106 @@ async def run():
     log("🚀 Daily Task 自动任务 (Playwright+hcaptcha-challenger+Gemini)")
     log("=" * 55)
 
-    proxy_server = start_proxy()
-
-    from playwright.async_api import async_playwright
-
-    agent_holder = {"agent": None, "key_index": 0}
-
-    async with async_playwright() as p:
-        launch_kwargs = {
-            "headless": True,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        if proxy_server:
-            launch_kwargs["proxy"] = {"server": proxy_server}
-
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            ignore_https_errors=True,
-        )
-        page = await context.new_page()
-
-        # 出口 IP 确认
+    # 任务级重试
+    max_task_retries = 3
+    for task_retry in range(max_task_retries):
         try:
-            await page.goto(IPTEST_URL, timeout=30000)
-            ip = (await page.inner_text("body")).strip()
-            log(f"✅ 浏览器出口 IP: {ip}")
+            log(f"\n📋 任务运行 ({task_retry + 1}/{max_task_retries})")
+            
+            proxy_server = start_proxy()
+
+            from playwright.async_api import async_playwright
+
+            agent_holder = {"agent": None, "key_index": 0}
+
+            async with async_playwright() as p:
+                launch_kwargs = {
+                    "headless": True,
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-web-security",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                    ],
+                }
+                if proxy_server:
+                    launch_kwargs["proxy"] = {"server": proxy_server}
+
+                browser = await p.chromium.launch(**launch_kwargs)
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    ignore_https_errors=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                page = await context.new_page()
+
+                # 出口 IP 确认
+                try:
+                    await page.goto(IPTEST_URL, timeout=30000)
+                    ip = (await page.inner_text("body")).strip()
+                    log(f"✅ 浏览器出口 IP: {ip}")
+                except Exception as e:
+                    log(f"⚠️ 获取出口 IP 失败: {e}")
+
+                # 初始化 hcaptcha-challenger
+                agent_holder["agent"] = await build_agent(page, 0)
+                # 安装 token 监听器
+                install_token_listener(page, agent_holder.setdefault("token_holder", {}))
+                log(f"🤖 hcaptcha-challenger Agent 就绪 ({len(GEMINI_KEYS)} keys)")
+
+                try:
+                    ok, reason = await site_login(page, agent_holder, email, password)
+                    if not ok:
+                        log(f"❌ 登录失败: {reason}")
+                        send_tg(f"❌ Task 登录失败: {reason}")
+                        await send_tg_screenshot(page, "登录失败")
+                        # 如果是验证码问题，等待后重试
+                        if "hCaptcha" in reason and task_retry < max_task_retries - 1:
+                            wait_time = 60 * (task_retry + 1)
+                            log(f"⏳ 等待 {wait_time} 秒后重试...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        return False
+
+                    await send_tg_screenshot(page, "✅ 登录成功")
+                    ok2, reason2 = await do_task(page, email)
+                    log(f"{'✅' if ok2 else '❌'} {reason2}")
+                    
+                    if ok2:
+                        return True
+                    elif task_retry < max_task_retries - 1:
+                        wait_time = 30 * (task_retry + 1)
+                        log(f"⏳ 任务失败，等待 {wait_time} 秒后重试...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        return False
+                        
+                except Exception as e:
+                    log(f"❌ 运行异常: {e}")
+                    send_tg(f"❌ Task 异常: {str(e)[:200]}")
+                    try:
+                        await send_tg_screenshot(page, "error")
+                    except Exception:
+                        pass
+                    
+                    if task_retry < max_task_retries - 1:
+                        wait_time = 60 * (task_retry + 1)
+                        log(f"⏳ 异常后等待 {wait_time} 秒重试...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        return False
+                finally:
+                    await browser.close()
+                    
         except Exception as e:
-            log(f"⚠️ 获取出口 IP 失败: {e}")
-
-        # 初始化 hcaptcha-challenger（gemini-3.5-flash-lite，429 自动换 Key）
-        agent_holder["agent"] = await build_agent(page, 0)
-        # 安装 token 监听器：挑战通过时直接拦截 checkcaptcha 响应
-        install_token_listener(page, agent_holder.setdefault("token_holder", {}))
-        log(f"🤖 hcaptcha-challenger Agent 就绪 (gemini-3.5-flash-lite, {len(GEMINI_KEYS)} keys)")
-
-        try:
-            ok, reason = await site_login(page, agent_holder, email, password)
-            if not ok:
-                log(f"❌ 登录失败: {reason}")
-                send_tg(f"❌ Task 登录失败: {reason}")
-                await send_tg_screenshot(page, "登录失败")
+            log(f"❌ 任务级异常: {e}")
+            if task_retry < max_task_retries - 1:
+                await asyncio.sleep(30 * (task_retry + 1))
+            else:
                 return False
-
-            await send_tg_screenshot(page, "✅ 登录成功")
-            ok2, reason2 = await do_task(page, email)
-            log(f"{'✅' if ok2 else '❌'} {reason2}")
-            return ok2
-        except Exception as e:
-            log(f"❌ 运行异常: {e}")
-            send_tg(f"❌ Task 异常: {str(e)[:200]}")
-            try:
-                await send_tg_screenshot(page, "error")
-            except Exception:
-                pass
-            return False
-        finally:
-            await browser.close()
+    
+    return False
 
 
 def main():
