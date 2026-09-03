@@ -1,11 +1,11 @@
-name: 🎮 Daily Task (Gemini API免费方案)
+name: 🎮 Daily Task (Gemini免费方案)
 
 on:
   repository_dispatch:
     types: [daily-task]
   workflow_dispatch:
   schedule:
-    - cron: '45 0,1,6,8,23 * * *'
+    - cron: '20 1,4,7,10,13,16,20,22 * * *'
 
 concurrency:
   group: daily-task-run
@@ -15,7 +15,7 @@ jobs:
   run-task:
     name: 🎮 Daily Task
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45  # 增加到45分钟
 
     steps:
       - name: 1. 检出代码
@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ── 依赖缓存：pip 包 + Playwright 浏览器，命中缓存只需 ~20 秒 ──
+      # ── 依赖缓存 ──
       - name: 3. 缓存 pip 包
         uses: actions/cache@v4
         with:
@@ -38,17 +38,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: pw-v1-${{ runner.os }}-chromium
+          key: pw-v1-${{ runner.os }}-chromium-v2
           restore-keys: pw-v1-${{ runner.os }}-
 
-      - name: 5. 安装依赖（有缓存时秒过）
+      - name: 5. 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -U playwright requests pyyaml 'hcaptcha-challenger>=0.19'
+          pip install -U playwright requests pyyaml 'hcaptcha-challenger>=0.19' google-genai
           python -m playwright install chromium --with-deps
           echo "✅ Python 依赖完成"
 
-      - name: 6. 安装 Sing-Box（代理转换）
+      - name: 6. 安装 Sing-Box
         env:
           PROXY_STR: ${{ secrets.TASK_PROXY_STR }}
         run: |
@@ -61,7 +61,7 @@ jobs:
             echo "ℹ️ 未配置代理，跳过"
           fi
 
-      # ── 执行任务：脚本内部自动轮换节点 + 轮换 Gemini Key ──
+      # ── 执行任务（带重试机制）──
       - name: 7. 执行任务
         env:
           ACCOUNTS:       ${{ secrets.TASK_ACCOUNTS }}
@@ -71,7 +71,31 @@ jobs:
           TASK_PROJECTS_URL: ${{ secrets.TASK_PROJECTS_URL }}
           TG_BOT_TOKEN:   ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:     ${{ secrets.TG_CHAT_ID }}
-        run: python daily_task.py
+        run: |
+          # 添加任务级重试
+          for i in 1 2 3; do
+            echo "=========================================="
+            echo "🚀 第 $i 次运行尝试"
+            echo "=========================================="
+            
+            # 运行主脚本
+            python daily_task.py
+            
+            # 检查退出码
+            if [ $? -eq 0 ]; then
+              echo "✅ 任务成功完成"
+              exit 0
+            else
+              echo "❌ 任务失败（第 $i 次）"
+              if [ $i -lt 3 ]; then
+                echo "⏳ 等待 30 秒后重试..."
+                sleep 30
+              fi
+            fi
+          done
+          
+          echo "❌ 所有尝试均失败"
+          exit 1
 
       - name: 8. 上传截图
         if: always()
@@ -79,4 +103,5 @@ jobs:
         with:
           name: screenshots-${{ github.run_number }}
           path: screenshots/
-          retention-days: 3
+          retention-days: 7  # 增加到7天
+          if-no-files-found: ignore
